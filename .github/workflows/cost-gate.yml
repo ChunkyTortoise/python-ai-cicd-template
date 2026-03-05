@@ -1,0 +1,112 @@
+# =============================================================================
+# Cost Gate: LLM Token Budget Check
+# =============================================================================
+# Monitors AI/LLM token usage and flags budget overruns. Essential for any
+# service that calls OpenAI, Anthropic, or other LLM APIs.
+#
+# Runs every 6 hours on schedule, on-demand, and when config files change.
+#
+# Customize:
+#   - Set TOKEN_BUDGET_MONTHLY in GitHub secrets (default: 5000000)
+#   - Adjust cost rates for your LLM provider
+#   - Add custom metrics collection from your logging pipeline
+# =============================================================================
+
+name: Cost Gate
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"  # Every 6 hours
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/cost-gate.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  token-budget-check:
+    name: Token Budget Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Analyze token usage
+        env:
+          TOKEN_BUDGET_MONTHLY: ${{ secrets.TOKEN_BUDGET_MONTHLY || '5000000' }}
+        run: |
+          cat > check_budget.py << 'PYEOF'
+          """
+          Token budget gate.
+
+          In production, replace the stub metrics below with real data from:
+            - Your logging pipeline (CloudWatch, Datadog, etc.)
+            - Anthropic/OpenAI usage API
+            - Application-level token counters
+
+          This template shows the structure and math.
+          """
+          import json
+          import os
+          from datetime import datetime
+          from pathlib import Path
+
+          BUDGET = int(os.environ.get("TOKEN_BUDGET_MONTHLY", "5000000"))
+
+          # --- Replace this section with real metrics collection ---
+          # Example: query your logging backend for token counts
+          monthly_input_tokens = 0
+          monthly_output_tokens = 0
+          total_tokens = monthly_input_tokens + monthly_output_tokens
+          # --- End stub section ---
+
+          # Cost calculation (Anthropic Claude Sonnet rates as example)
+          COST_PER_1M_INPUT = 3.00
+          COST_PER_1M_OUTPUT = 15.00
+
+          monthly_cost = (
+              monthly_input_tokens / 1_000_000 * COST_PER_1M_INPUT
+              + monthly_output_tokens / 1_000_000 * COST_PER_1M_OUTPUT
+          )
+
+          usage_pct = (total_tokens / BUDGET * 100) if BUDGET > 0 else 0
+
+          print(f"Monthly token budget: {BUDGET:,}")
+          print(f"Tokens used: {total_tokens:,} ({usage_pct:.1f}%)")
+          print(f"Estimated cost: ${monthly_cost:.2f}")
+
+          if usage_pct > 90:
+              print(f"::error::Token budget at {usage_pct:.1f}% -- over 90% threshold")
+              exit(1)
+          elif usage_pct > 75:
+              print(f"::warning::Token budget at {usage_pct:.1f}% -- approaching limit")
+          else:
+              print("Budget healthy")
+
+          # Save report artifact
+          Path("reports").mkdir(exist_ok=True)
+          with open("reports/cost-gate-report.json", "w") as f:
+              json.dump({
+                  "timestamp": datetime.now().isoformat(),
+                  "budget": BUDGET,
+                  "total_tokens": total_tokens,
+                  "usage_pct": round(usage_pct, 1),
+                  "estimated_cost_usd": round(monthly_cost, 2),
+              }, f, indent=2)
+          PYEOF
+
+          python check_budget.py
+
+      - name: Upload cost report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cost-gate-report
+          path: reports/cost-gate-report.json

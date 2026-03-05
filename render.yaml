@@ -1,0 +1,26 @@
+# Render Blueprint
+# Deploy: connect this repo on Render and it will auto-detect this file.
+# Docs: https://docs.render.com/infrastructure-as-code
+
+services:
+  - type: web
+    name: YOUR_SERVICE_NAME
+    runtime: docker
+    plan: free  # or starter, standard, etc.
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_ENV
+        value: production
+      - key: ANTHROPIC_API_KEY
+        sync: false  # Must be set manually in Render dashboard
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: YOUR_SERVICE_NAME-redis
+          property: connectionString
+
+  - type: redis
+    name: YOUR_SERVICE_NAME-redis
+    plan: free
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []  # Only allow internal connections

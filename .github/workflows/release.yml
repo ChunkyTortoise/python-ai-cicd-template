@@ -1,0 +1,74 @@
+# =============================================================================
+# Release: Auto-tag on Merge to Main
+# =============================================================================
+# Creates a semantic version tag (v1.0.0) when code merges to main.
+# Reads version from pyproject.toml and creates a GitHub release with
+# auto-generated changelog.
+#
+# Customize:
+#   - Adjust version extraction if not using pyproject.toml
+#   - Add build artifacts (wheel, sdist) to the release
+#   - Add PyPI publishing step for library packages
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Tag & Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for changelog generation
+
+      - name: Extract version from pyproject.toml
+        id: version
+        run: |
+          VERSION=$(python3 -c "
+          import re
+          with open('pyproject.toml') as f:
+              content = f.read()
+          match = re.search(r'version\s*=\s*\"([^\"]+)\"', content)
+          print(match.group(1) if match else '0.0.0')
+          ")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${VERSION}"
+
+      - name: Check if tag exists
+        id: check
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists, skipping release"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Will create tag $TAG"
+          fi
+
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = `v${{ steps.version.outputs.version }}`;
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: tag,
+              generate_release_notes: true,
+              draft: false,
+              prerelease: false,
+            });
+            console.log(`Created release ${tag}`);

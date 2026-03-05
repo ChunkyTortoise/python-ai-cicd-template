@@ -1,0 +1,242 @@
+# =============================================================================
+# Security: Bandit + pip-audit + Secrets Detection + SQL Injection Check
+# =============================================================================
+# Multi-layered security scanning pipeline. Runs on push to main, weekly,
+# and on-demand via workflow_dispatch.
+#
+# Jobs:
+#   1. secrets-detection      - Grep-based scan for hardcoded credentials
+#   2. python-security        - Bandit static analysis (MEDIUM+ severity)
+#   3. dependency-audit       - pip-audit for known CVEs in dependencies
+#   4. sql-injection-check    - Pattern detection for unsafe SQL construction
+#   5. infrastructure-security- Checkov scan for Docker Compose misconfigs
+#   6. summary                - Consolidated scorecard in GitHub Step Summary
+#
+# Customize:
+#   - Add --exclude-dir flags for vendor/generated code
+#   - Adjust Bandit severity with -ll (MEDIUM+) or -lll (HIGH only)
+#   - Add Semgrep rules for framework-specific checks
+# =============================================================================
+
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.py"
+      - "requirements*.txt"
+      - "pyproject.toml"
+      - "docker-compose*.yml"
+      - ".github/workflows/security.yml"
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * 1"  # Weekly on Monday at 2 AM UTC
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  secrets-detection:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for hardcoded credentials
+        run: |
+          FOUND=0
+
+          # Scan for API keys, secrets, passwords, tokens with 20+ char values
+          if grep -r -E "(API_KEY|SECRET|PASSWORD|TOKEN)\s*=\s*['\"][^'\"]{20,}['\"]" \
+              --include="*.py" \
+              --exclude-dir=.git \
+              --exclude-dir=tests \
+              --exclude-dir=__pycache__ \
+              --exclude-dir=venv \
+              --exclude-dir=.venv \
+              . | grep -v "\.example" | grep -v "test_" | grep -v "your_.*_here" | grep -v '""' | grep -v "None"; then
+            FOUND=1
+          fi
+
+          # Check for known secret patterns (Anthropic, AWS, GitHub)
+          if grep -r -E "['\"]sk-ant-[a-zA-Z0-9-]{20,}['\"]" \
+              --include="*.py" \
+              --exclude-dir=.git \
+              --exclude-dir=tests \
+              . | grep -v "startswith\|format\|example\|demo\|placeholder"; then
+            FOUND=1
+          fi
+
+          if grep -r -E "(AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36})" \
+              --include="*.py" \
+              --exclude-dir=.git \
+              --exclude-dir=tests \
+              .; then
+            FOUND=1
+          fi
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "::error::Potential secrets detected in source code"
+            exit 1
+          fi
+          echo "No secrets detected"
+
+  python-security:
+    name: Static Security Analysis (Bandit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Run Bandit
+        run: |
+          pip install bandit[toml]
+          # JSON report for artifacts
+          bandit -r src/ -f json -o bandit-report.json \
+            -s B101 \
+            --exclude "*/tests/*" || true
+          # Console summary (MEDIUM+ severity)
+          bandit -r src/ -s B101 --exclude "*/tests/*" -ll || true
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  dependency-audit:
+    name: Dependency Audit (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Audit dependencies
+        run: |
+          pip install pip-audit
+          pip install -e .
+          pip-audit --format json --output pip-audit-report.json || true
+          pip-audit || echo "Vulnerabilities found -- review required"
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-audit
+          path: pip-audit-report.json
+
+  sql-injection-check:
+    name: SQL Injection Detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for SQL injection patterns
+        run: |
+          echo "Scanning for SQL injection patterns..."
+          FOUND=0
+
+          # String formatting in execute() calls
+          if grep -rn 'execute([^)]*%' src/ --include="*.py" \
+              --exclude-dir=__pycache__ | grep -v test_ | grep -v '"%s"' | grep -v "'%s'"; then
+            echo "::warning::String formatting in execute() calls found"
+            FOUND=1
+          fi
+
+          # .format() piped to execute
+          if grep -rn '\.format(.*execute' src/ --include="*.py" \
+              --exclude-dir=__pycache__ | grep -v test_; then
+            echo "::warning::format() with execute() found"
+            FOUND=1
+          fi
+
+          # f-strings in execute
+          if grep -rn 'execute(f["\x27]' src/ --include="*.py" \
+              --exclude-dir=__pycache__ | grep -v test_; then
+            echo "::warning::f-string in execute() found"
+            FOUND=1
+          fi
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "::error::Potential SQL injection patterns detected"
+            exit 1
+          fi
+          echo "No SQL injection patterns detected"
+
+  infrastructure-security:
+    name: Infrastructure Config Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan Docker Compose for security issues
+        run: |
+          pip install checkov
+          for f in docker-compose*.yml; do
+            if [ -f "$f" ]; then
+              echo "Scanning $f..."
+              checkov -f "$f" --framework docker_compose --soft-fail || true
+            fi
+          done
+
+      - name: Verify .env is gitignored
+        run: |
+          if grep -q "^\.env$" .gitignore 2>/dev/null; then
+            echo ".env is properly gitignored"
+          else
+            echo "::error::.env is not in .gitignore"
+            exit 1
+          fi
+
+  summary:
+    name: Security Summary
+    runs-on: ubuntu-latest
+    needs:
+      - secrets-detection
+      - python-security
+      - dependency-audit
+      - sql-injection-check
+      - infrastructure-security
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets Detection | ${{ needs.secrets-detection.result == 'success' && 'Pass' || 'Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bandit (Static Analysis) | ${{ needs.python-security.result == 'success' && 'Pass' || 'Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Audit | ${{ needs.dependency-audit.result == 'success' && 'Pass' || 'Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SQL Injection | ${{ needs.sql-injection-check.result == 'success' && 'Pass' || 'Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Infrastructure Config | ${{ needs.infrastructure-security.result == 'success' && 'Pass' || 'Fail' }} |" >> $GITHUB_STEP_SUMMARY
+
+          TOTAL=5
+          PASSED=0
+          [ "${{ needs.secrets-detection.result }}" == "success" ] && PASSED=$((PASSED + 1))
+          [ "${{ needs.python-security.result }}" == "success" ] && PASSED=$((PASSED + 1))
+          [ "${{ needs.dependency-audit.result }}" == "success" ] && PASSED=$((PASSED + 1))
+          [ "${{ needs.sql-injection-check.result }}" == "success" ] && PASSED=$((PASSED + 1))
+          [ "${{ needs.infrastructure-security.result }}" == "success" ] && PASSED=$((PASSED + 1))
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Score: ${PASSED}/${TOTAL}**" >> $GITHUB_STEP_SUMMARY

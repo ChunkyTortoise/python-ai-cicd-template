@@ -1,0 +1,77 @@
+# =============================================================================
+# Docker Build: Build + Push to Docker Hub
+# =============================================================================
+# Builds a multi-platform Docker image and pushes to Docker Hub on merge
+# to main. Uses GitHub Actions cache for fast rebuilds.
+#
+# Required secrets:
+#   - DOCKERHUB_USERNAME: Your Docker Hub username
+#   - DOCKERHUB_TOKEN:    Docker Hub access token (not password)
+#
+# Customize:
+#   - Replace YOUR_DOCKERHUB_ORG/YOUR_SERVICE_NAME with your image name
+#   - Add platforms (e.g., linux/arm64) if deploying to ARM
+#   - Adjust context path if Dockerfile is in a subdirectory
+# =============================================================================
+
+name: Docker Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "requirements*.txt"
+      - ".github/workflows/docker-build.yml"
+  workflow_dispatch:
+    inputs:
+      force_push:
+        description: "Push image even without code changes"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: docker-build
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          # TODO: Replace YOUR_DOCKERHUB_ORG/YOUR_SERVICE_NAME
+          IMAGE="docker.io/YOUR_DOCKERHUB_ORG/YOUR_SERVICE_NAME:sha-${SHORT_SHA}"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Tagged as: ${IMAGE}"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            YOUR_DOCKERHUB_ORG/YOUR_SERVICE_NAME:sha-${{ steps.meta.outputs.short_sha }}
+            YOUR_DOCKERHUB_ORG/YOUR_SERVICE_NAME:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
